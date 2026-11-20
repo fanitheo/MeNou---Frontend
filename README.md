@@ -51,7 +51,7 @@
 3. **Configure environment variables:**
    Create a `.env` file in the root directory and set your backend API URL:
 
-       VITE_API_URL=http://localhost:8000
+       VITE_API_URL=http://localhost:8677
 
 4. **Run the development server:**
 
