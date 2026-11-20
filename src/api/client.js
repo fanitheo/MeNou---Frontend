@@ -10,16 +10,31 @@ const apiClient = axios.create({
 });
 
 apiClient.interceptors.response.use(
-  (response) => response,
+  (response) => {
+    const body = response.data;
+    if (body && typeof body === 'object' && body.success === true && 'data' in body) {
+      const inner = body.data;
+      if (inner && typeof inner === 'object' && !Array.isArray(inner) && body.message) {
+        response.data = { ...inner, message: inner.message || body.message };
+      } else if (inner === null || inner === undefined) {
+        response.data = { message: body.message };
+      } else {
+        response.data = inner;
+      }
+    }
+    return response;
+  },
   (error) => {
+    const resData = error?.response?.data;
     const serverMessage =
-      error?.response?.data?.message ||
-      error?.response?.data?.error ||
+      resData?.message ||
+      resData?.error?.message ||
       error?.message ||
       'Unexpected server error';
     const enrichedError = new Error(serverMessage);
-    enrichedError.status = error?.response?.status;
-    enrichedError.data = error?.response?.data;
+    enrichedError.status = error?.response?.status || resData?.error?.code;
+    enrichedError.details = resData?.error?.details || null;
+    enrichedError.data = resData;
     return Promise.reject(enrichedError);
   }
 );

@@ -1,340 +1,491 @@
-import React, { useState, useEffect, useCallback } from 'react';
-import { useLocation } from 'react-router-dom';
-import { Menu, Search } from 'lucide-react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
+import { Menu, Search, X } from 'lucide-react';
 import Header from '../components/Header';
 import BottomNav from '../components/BottomNav';
-import RecipeCard from '../components/RecipeCard';
 import AlertBanner from '../components/AlertBanner';
-import ExpirationToastBanner from '../components/ExpirationToastBanner';
-import NotificationsModal from '../components/NotificationsModal';
-import {
-  getForYouRecipes,
-  searchHomeRecipes,
-  getDiscoveryRecipes
-} from '../api/recipesApi';
+import RecipeCard from '../components/RecipeCard';
 import { useApp } from '../context/AppContext';
-import { SEARCH_FILTER_TAGS } from '../utils/constants';
+import { useDebounce } from '../hooks/useDebounce';
+import {
+  getDiscoveryRecipes,
+  getForYouRecipes,
+  getRecipePreview,
+  searchHomeRecipes
+} from '../api/recipesApi';
+
+const FILTER_GROUPS = [
+  {
+    label: 'Cooking Time',
+    options: [
+      { label: '≤ 15 min', value: 'maxTime:15' },
+      { label: '≤ 20 min', value: 'maxTime:20' },
+      { label: '≤ 30 min', value: 'maxTime:30' }
+    ]
+  },
+  {
+    label: 'Meal Type',
+    options: [
+      { label: 'Breakfast', value: 'breakfast' },
+      { label: 'Brunch', value: 'brunch' },
+      { label: 'Main dish', value: 'main dish' },
+      { label: 'Salads', value: 'salads' },
+      { label: 'Side dishes', value: 'side dishes' },
+      { label: 'Snacks', value: 'snacks' },
+      { label: 'Desserts', value: 'desserts' }
+    ]
+  },
+  {
+    label: 'Equipment',
+    options: [
+      { label: 'Frying pan', value: 'frying pan' },
+      { label: 'Pot', value: 'pot' },
+      { label: 'Oven', value: 'oven' },
+      { label: 'Air fryer', value: 'air fryer' },
+      { label: 'Wok', value: 'wok' },
+      { label: 'Pressure cooker', value: 'pressure cooker' },
+      { label: 'No-mixer', value: 'no-mixer' }
+    ]
+  }
+];
 
 export default function HomePage() {
-  const location = useLocation();
-  const { session, kitchenIngredients, favoriteRecipes } = useApp();
+  const navigate = useNavigate();
+  const {
+    userID,
+    kitchenID,
+    favorites,
+    isRecipeFavorite,
+    toggleFavoriteRecipe,
+    syncFavoritesFromRecipes
+  } = useApp();
 
-  const [activeTab, setActiveTab] = useState(
-    location.state?.restoreTab || 'For you'
-  );
+  const favoritesRef = useRef(favorites);
+  favoritesRef.current = favorites;
+
+  const [activeTab, setActiveTab] = useState('for-you');
   const [searchQuery, setSearchQuery] = useState('');
+  const debouncedQuery = useDebounce(searchQuery, 350);
+
+  const [showFilters, setShowFilters] = useState(false);
   const [selectedFilters, setSelectedFilters] = useState([]);
-  const [showFilterDrawer, setShowFilterDrawer] = useState(false);
 
   const [recipes, setRecipes] = useState([]);
   const [loading, setLoading] = useState(false);
-  const [infoAlert, setInfoAlert] = useState({
-    type: '',
-    message: '',
-    actionLabel: '',
-    actionTo: ''
-  });
-  const [isNotifOpen, setIsNotifOpen] = useState(false);
+  const [errorMsg, setErrorMsg] = useState('');
+  const [actionRedirect, setActionRedirect] = useState('');
 
-  const isSearching = searchQuery.trim() !== '' || selectedFilters.length > 0;
-  const currentSourceLabel = isSearching ? 'Search Results' : activeTab;
+  const isSearchingOrFiltering =
+    debouncedQuery.trim().length > 0 || selectedFilters.length > 0;
 
-  const loadTabContent = useCallback(async () => {
+  const toggleFilter = (value) => {
+    setSelectedFilters((prev) =>
+      prev.includes(value) ? prev.filter((item) => item !== value) : [...prev, value]
+    );
+  };
+
+  const enrichRecipesWithPreview = useCallback(
+    async (rawList) => {
+      if (!Array.isArray(rawList) || rawList.length === 0) return [];
+
+      const enriched = await Promise.all(
+        rawList.map(async (item) => {
+          const hasCalories = item.calories !== undefined && item.calories !== null;
+          const hasTime = item.cookingTime !== undefined && item.cookingTime !== null;
+
+          if (hasCalories && hasTime) {
+            return item;
+          }
+
+          try {
+            const preview = await getRecipePreview(userID, kitchenID, item.recipeID);
+            return {
+              ...item,
+              ...preview,
+              calories:
+                preview?.calories ??
+                item.calories ??
+                item.recipeCaloricValue ??
+                0,
+              cookingTime:
+                preview?.cookingTime ??
+                item.cookingTime ??
+                0
+            };
+          } catch {
+            return {
+              ...item,
+              calories: item.calories ?? item.recipeCaloricValue ?? 0,
+              cookingTime: item.cookingTime ?? 0
+            };
+          }
+        })
+      );
+
+      return enriched;
+    },
+    [userID, kitchenID]
+  );
+
+  const loadRecipes = useCallback(async () => {
     setLoading(true);
-    setInfoAlert({ type: '', message: '', actionLabel: '', actionTo: '' });
+    setErrorMsg('');
+    setActionRedirect('');
 
     try {
-      if (searchQuery.trim() !== '' || selectedFilters.length > 0) {
-        const results = await searchHomeRecipes(
-          session.userID,
-          searchQuery,
-          selectedFilters
-        );
-        setRecipes(results);
-        if (results.length === 0) {
-          setInfoAlert({
-            type: 'warning',
-            message: 'No recipes matching your search criteria were found.'
+      let data = [];
+
+      if (isSearchingOrFiltering) {
+        data = await searchHomeRecipes(userID, debouncedQuery.trim(), selectedFilters);
+      } else if (activeTab === 'for-you') {
+        data = await getForYouRecipes(userID, kitchenID);
+      } else if (activeTab === 'discovery') {
+        const rawDiscovery = await getDiscoveryRecipes(kitchenID);
+        data = await enrichRecipesWithPreview(rawDiscovery);
+      } else if (activeTab === 'favourites') {
+        const [forYouRes, discoveryRes, allRes] = await Promise.allSettled([
+          getForYouRecipes(userID, kitchenID),
+          getDiscoveryRecipes(kitchenID),
+          searchHomeRecipes(userID, '', [])
+        ]);
+
+        const mergedMap = new Map();
+        if (forYouRes.status === 'fulfilled' && Array.isArray(forYouRes.value)) {
+          forYouRes.value.forEach((r) => mergedMap.set(Number(r.recipeID), r));
+        }
+        if (allRes.status === 'fulfilled' && Array.isArray(allRes.value)) {
+          allRes.value.forEach((r) => {
+            if (!mergedMap.has(Number(r.recipeID))) {
+              mergedMap.set(Number(r.recipeID), r);
+            }
           });
         }
-        return;
-      }
-
-      if (activeTab === 'Favourites') {
-        setRecipes(favoriteRecipes);
-        if (favoriteRecipes.length === 0) {
-          setInfoAlert({
-            type: 'info',
-            message:
-              'You have not saved any favourite recipes yet. Tap the heart icon on a recipe!'
+        if (discoveryRes.status === 'fulfilled' && Array.isArray(discoveryRes.value)) {
+          const enrichedDiscovery = await enrichRecipesWithPreview(discoveryRes.value);
+          enrichedDiscovery.forEach((r) => {
+            if (!mergedMap.has(Number(r.recipeID))) {
+              mergedMap.set(Number(r.recipeID), r);
+            }
           });
         }
-        return;
-      }
 
-      if (activeTab === 'Discovery') {
-        const list = await getDiscoveryRecipes(session.kitchenID);
-        setRecipes(list);
-        if (list.length === 0) {
-          setInfoAlert({
-            type: 'info',
-            message:
-              'No community recipes available yet. Be the first to post one!'
-          });
+        const allMerged = Array.from(mergedMap.values());
+        syncFavoritesFromRecipes(allMerged);
+
+        const storedFavRaw = localStorage.getItem(`menou_favorites_${userID}`);
+        let currentFavs = favoritesRef.current || [];
+        if (storedFavRaw) {
+          try {
+            currentFavs = JSON.parse(storedFavRaw);
+          } catch {
+            // keep currentFavs
+          }
         }
-        return;
+
+        data = allMerged.filter((r) => currentFavs.includes(Number(r.recipeID)));
       }
 
-      // AD-9 & User Story S-5 checks for "For you"
-      if (!session.hasProfile) {
-        setRecipes([]);
-        setInfoAlert({
-          type: 'error',
-          message:
-            'No recipes can be suggested due to missing personal information',
-          actionLabel: 'Complete Personal Profile',
-          actionTo: '/profile'
-        });
-        return;
+      const safeList = Array.isArray(data) ? data : [];
+      if (activeTab !== 'favourites') {
+        syncFavoritesFromRecipes(safeList);
       }
-
-      if (kitchenIngredients.length === 0) {
-        setRecipes([]);
-        setInfoAlert({
-          type: 'error',
-          message: 'No recipes can be suggested due to lack of ingredients',
-          actionLabel: 'Go to My Kitchen',
-          actionTo: '/my-kitchen'
-        });
-        return;
-      }
-
-      const recommended = await getForYouRecipes(
-        session.userID,
-        session.kitchenID
-      );
-      setRecipes(recommended);
-      if (recommended.length === 0) {
-        setInfoAlert({
-          type: 'warning',
-          message:
-            'No recipes matching your current profile and inventory were found'
-        });
-      }
+      setRecipes(safeList);
     } catch (err) {
       setRecipes([]);
-      setInfoAlert({
-        type: 'error',
-        message: err.message || 'Unable to load recipes from server'
-      });
+      const msg = err?.message || 'Unable to load recipes from server.';
+      setErrorMsg(msg);
+
+      if (msg.toLowerCase().includes('personal information') || msg.toLowerCase().includes('profile')) {
+        setActionRedirect('/profile');
+      } else if (msg.toLowerCase().includes('lack of ingredients') || msg.toLowerCase().includes('kitchen')) {
+        setActionRedirect('/my-kitchen');
+      }
     } finally {
       setLoading(false);
     }
   }, [
+    userID,
+    kitchenID,
     activeTab,
-    searchQuery,
+    isSearchingOrFiltering,
+    debouncedQuery,
     selectedFilters,
-    session.userID,
-    session.kitchenID,
-    session.hasProfile,
-    kitchenIngredients.length,
-    favoriteRecipes
+    enrichRecipesWithPreview,
+    syncFavoritesFromRecipes
   ]);
 
   useEffect(() => {
-    loadTabContent();
-  }, [loadTabContent]);
+    loadRecipes();
+  }, [loadRecipes]);
 
-  const toggleFilterTag = (tag) => {
-    setSelectedFilters((prev) =>
-      prev.includes(tag) ? prev.filter((t) => t !== tag) : [...prev, tag]
-    );
-  };
-
-  const handleSearchSubmit = (e) => {
-    e.preventDefault();
-    loadTabContent();
-  };
+  const displayedRecipes =
+    !isSearchingOrFiltering && activeTab === 'favourites'
+      ? recipes.filter((r) => isRecipeFavorite(r))
+      : recipes;
 
   return (
     <>
-      <Header title="Home" onOpenNotifications={() => setIsNotifOpen(true)} />
-
+      <Header title="Home" showBack={false} />
       <main className="page-content">
-        <ExpirationToastBanner onOpenAll={() => setIsNotifOpen(true)} />
-
-        <form
-          onSubmit={handleSearchSubmit}
-          style={{ position: 'relative', marginBottom: '12px' }}
+        {/* Unified Search Pill matching M-8.png */}
+        <div
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: 12,
+            backgroundColor: 'var(--bg-cream)',
+            borderRadius: 'var(--radius-pill)',
+            height: 48,
+            padding: '0 18px',
+            marginBottom: 14,
+            boxShadow: '0 2px 8px rgba(29, 43, 26, 0.08)'
+          }}
         >
           <button
             type="button"
-            aria-label="Toggle search filters"
-            onClick={() => setShowFilterDrawer((prev) => !prev)}
+            onClick={() => setShowFilters((prev) => !prev)}
+            aria-label="Toggle filters"
             style={{
-              position: 'absolute',
-              left: '14px',
-              top: '50%',
-              transform: 'translateY(-50%)',
-              background: 'transparent',
+              background: 'none',
               border: 'none',
+              padding: 0,
+              display: 'inline-flex',
+              alignItems: 'center',
+              justifyContent: 'center',
               cursor: 'pointer',
-              color: 'var(--text-dark)',
-              display: 'flex'
+              position: 'relative',
+              color: '#2c3529'
             }}
           >
-            <Menu size={20} />
+            <Menu size={22} strokeWidth={2.2} />
+            {selectedFilters.length > 0 && (
+              <span
+                style={{
+                  position: 'absolute',
+                  top: -3,
+                  right: -4,
+                  width: 8,
+                  height: 8,
+                  borderRadius: '50%',
+                  backgroundColor: 'var(--primary-forest)'
+                }}
+              />
+            )}
           </button>
 
           <input
             type="text"
+            placeholder="Search"
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
-            placeholder="Search"
-            className="input-cream"
             style={{
-              borderRadius: 'var(--radius-pill)',
-              padding: '12px 44px',
-              boxShadow: 'var(--shadow-card)'
+              flex: 1,
+              border: 'none',
+              background: 'transparent',
+              outline: 'none',
+              fontSize: '0.98rem',
+              color: 'var(--text-dark)',
+              fontFamily: 'inherit'
             }}
           />
 
-          <button
-            type="submit"
-            aria-label="Search recipes"
-            style={{
-              position: 'absolute',
-              right: '14px',
-              top: '50%',
-              transform: 'translateY(-50%)',
-              background: 'transparent',
-              border: 'none',
-              cursor: 'pointer',
-              color: 'var(--text-dark)',
-              display: 'flex'
-            }}
-          >
-            <Search size={20} />
-          </button>
-        </form>
+          {searchQuery && (
+            <button
+              type="button"
+              onClick={() => setSearchQuery('')}
+              aria-label="Clear search"
+              style={{
+                background: 'none',
+                border: 'none',
+                padding: 0,
+                display: 'inline-flex',
+                alignItems: 'center',
+                cursor: 'pointer',
+                color: 'var(--text-muted)'
+              }}
+            >
+              <X size={17} />
+            </button>
+          )}
 
-        {showFilterDrawer && (
+          <Search size={21} color="#2c3529" strokeWidth={2.2} style={{ flexShrink: 0 }} />
+        </div>
+
+        {/* Collapsible Filter Panel */}
+        {showFilters && (
           <div
             style={{
-              background: 'var(--bg-cream)',
+              backgroundColor: 'var(--bg-cream)',
               borderRadius: 'var(--radius-md)',
-              padding: '10px 12px',
-              marginBottom: '12px',
-              display: 'flex',
-              flexWrap: 'wrap',
-              gap: '8px'
+              padding: 16,
+              marginBottom: 14,
+              boxShadow: 'var(--shadow-card)',
+              display: 'grid',
+              gap: 12
             }}
           >
-            {SEARCH_FILTER_TAGS.map((tag) => {
-              const active = selectedFilters.includes(tag);
-              return (
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <strong style={{ color: 'var(--primary-forest)', fontSize: '0.95rem' }}>
+                Filter Recipes
+              </strong>
+              {selectedFilters.length > 0 && (
                 <button
-                  key={tag}
                   type="button"
-                  onClick={() => toggleFilterTag(tag)}
+                  onClick={() => setSelectedFilters([])}
                   style={{
-                    padding: '6px 12px',
-                    borderRadius: 'var(--radius-pill)',
-                    border: '1px solid var(--primary-forest)',
-                    background: active ? 'var(--primary-forest)' : '#fff',
-                    color: active ? '#fff' : 'var(--primary-forest)',
-                    fontSize: '0.8rem',
+                    background: 'none',
+                    border: 'none',
+                    color: 'var(--danger-red)',
+                    fontSize: '0.82rem',
                     fontWeight: 600,
-                    cursor: 'pointer'
+                    cursor: 'pointer',
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    gap: 4
                   }}
                 >
-                  {tag}
+                  <X size={14} /> Clear all
+                </button>
+              )}
+            </div>
+
+            {FILTER_GROUPS.map((group) => (
+              <div key={group.label}>
+                <div
+                  style={{
+                    fontSize: '0.78rem',
+                    fontWeight: 700,
+                    color: 'var(--text-muted)',
+                    marginBottom: 6,
+                    textTransform: 'uppercase',
+                    letterSpacing: '0.03em'
+                  }}
+                >
+                  {group.label}
+                </div>
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                  {group.options.map((opt) => {
+                    const active = selectedFilters.includes(opt.value);
+                    return (
+                      <button
+                        key={opt.value}
+                        type="button"
+                        onClick={() => toggleFilter(opt.value)}
+                        style={{
+                          padding: '5px 11px',
+                          borderRadius: '8px',
+                          border: '1px solid var(--primary-forest)',
+                          backgroundColor: active ? 'var(--primary-forest)' : '#ffffff',
+                          color: active ? '#ffffff' : 'var(--primary-forest)',
+                          fontSize: '0.82rem',
+                          fontWeight: 600,
+                          cursor: 'pointer'
+                        }}
+                      >
+                        {opt.label}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* Category Tabs matching M-8.png */}
+        {!isSearchingOrFiltering && (
+          <div
+            style={{
+              display: 'grid',
+              gridTemplateColumns: 'repeat(3, 1fr)',
+              gap: 10,
+              marginBottom: 16
+            }}
+          >
+            {[
+              { key: 'discovery', label: 'Discovery' },
+              { key: 'favourites', label: 'Favourites' },
+              { key: 'for-you', label: 'For you' }
+            ].map((tab) => {
+              const isActive = activeTab === tab.key;
+              return (
+                <button
+                  key={tab.key}
+                  type="button"
+                  onClick={() => setActiveTab(tab.key)}
+                  style={{
+                    padding: '10px 8px',
+                    borderRadius: '10px',
+                    border: 'none',
+                    fontWeight: 600,
+                    fontSize: '0.92rem',
+                    cursor: 'pointer',
+                    backgroundColor: isActive ? 'var(--primary-forest)' : 'var(--bg-cream)',
+                    color: isActive ? '#ffffff' : '#6c7368',
+                    boxShadow: '0 2px 6px rgba(29, 43, 26, 0.08)',
+                    transition: 'background-color 0.18s ease, color 0.18s ease'
+                  }}
+                >
+                  {tab.label}
                 </button>
               );
             })}
           </div>
         )}
 
-        <div
-          style={{
-            display: 'grid',
-            gridTemplateColumns: 'repeat(3, 1fr)',
-            gap: '8px',
-            marginBottom: '16px'
-          }}
-        >
-          {['Discovery', 'Favourites', 'For you'].map((tab) => {
-            const isActive = activeTab === tab && !isSearching;
-            return (
-              <button
-                key={tab}
-                type="button"
-                onClick={() => {
-                  setSearchQuery('');
-                  setSelectedFilters([]);
-                  setActiveTab(tab);
-                }}
-                style={{
-                  padding: '9px 10px',
-                  borderRadius: 'var(--radius-sm)',
-                  border: 'none',
-                  backgroundColor: isActive
-                    ? 'var(--primary-forest)'
-                    : 'var(--bg-cream)',
-                  color: isActive ? '#ffffff' : 'var(--text-muted)',
-                  fontWeight: isActive ? 700 : 500,
-                  fontSize: '0.92rem',
-                  cursor: 'pointer',
-                  boxShadow: '0 2px 6px rgba(0,0,0,0.06)'
-                }}
-              >
-                {tab}
-              </button>
-            );
-          })}
-        </div>
+        {/* Error / Redirect Banner */}
+        {errorMsg && (
+          <AlertBanner
+            type="warning"
+            message={errorMsg}
+            actionLabel={
+              actionRedirect === '/profile'
+                ? 'Complete Profile'
+                : actionRedirect === '/my-kitchen'
+                  ? 'Go to My Kitchen'
+                  : undefined
+            }
+            onAction={actionRedirect ? () => navigate(actionRedirect) : undefined}
+          />
+        )}
 
-        <AlertBanner
-          type={infoAlert.type}
-          message={infoAlert.message}
-          actionLabel={infoAlert.actionLabel}
-          actionTo={infoAlert.actionTo}
-        />
-
+        {/* Recipes Feed */}
         {loading ? (
+          <p style={{ textAlign: 'center', padding: 24, fontWeight: 600, color: 'var(--primary-forest)' }}>
+            Loading recipes...
+          </p>
+        ) : displayedRecipes.length === 0 && !errorMsg ? (
           <div
             style={{
-              textAlign: 'center',
-              padding: '32px',
-              background: 'var(--bg-cream)',
+              backgroundColor: 'var(--bg-cream)',
               borderRadius: 'var(--radius-lg)',
-              fontWeight: 600
+              padding: 24,
+              textAlign: 'center',
+              color: 'var(--text-muted)',
+              boxShadow: 'var(--shadow-card)'
             }}
           >
-            Loading recipes...
+            No recipes found for this selection.
           </div>
         ) : (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
-            {recipes.map((recipe) => (
-              <RecipeCard
-                key={recipe.recipeID}
-                recipe={recipe}
-                sourceLabel={currentSourceLabel}
-                sourceTab={activeTab}
-                onFavoriteError={(msg) =>
-                  setInfoAlert({ type: 'error', message: msg })
-                }
-              />
-            ))}
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+            {displayedRecipes.map((recipe) => {
+              const liked = isRecipeFavorite(recipe);
+              return (
+                <RecipeCard
+                  key={recipe.recipeID}
+                  recipe={{
+                    ...recipe,
+                    heartIcon: liked ? 'filled' : 'outline'
+                  }}
+                  isFavorite={liked}
+                  onToggleFavorite={toggleFavoriteRecipe}
+                />
+              );
+            })}
           </div>
         )}
       </main>
-
-      <NotificationsModal
-        isOpen={isNotifOpen}
-        onClose={() => setIsNotifOpen(false)}
-      />
-
       <BottomNav />
     </>
   );
